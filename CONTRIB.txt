@@ -1,13 +1,13 @@
 Contributing
 ======================
 
-To contribute to the ShowOff project:
+To contribute to the Showoff project:
 
-* Fork schacon/showoff
+* Fork puppetlabs/showoff
 
 * Use the ShowOff project in the 'example/' subdirectory to 
   add an example of new features or make sure you haven't
-  broken existin functionality.  I basically use this preso
+  broken existing functionality.  I basically use this preso
   as my unit tests.
 
 * Push your contribution to a branch named after your change

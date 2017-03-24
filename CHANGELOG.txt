@@ -1,0 +1,118 @@
+0.9.10.8
+  * Fixed that irritating double question bug.
+  * Made the question dismissal widget slightly less ugly.
+  * Incremental bullets are more usable in presenter view.
+      * Bullets you haven't gotten to yet are dimmed, not hidden.
+  * For that matter, they actually work now.
+  * The 'next' window is now resizable.
+  * Fixed a couple minor crash bugs.
+
+0.9.10.7
+  * Fixed some form rendering issues
+  * Handle slide background images better
+
+0.9.10.6
+  * Bugfix release: repair breakage from Firefox 34.x
+  * minor UI corrections for Firefox
+
+0.9.10.5
+  * New popout notes window button in the menubar.
+  * Minor bugfixes.
+
+0.9.10.4
+  * Bugfix release: don't initialize stats collection unless presenting
+
+0.9.10.3
+  * Adds the ability to merge in personal notes to the presenter notes.
+    See AUTHORING.rdoc for instructions.
+  * Generate valid HTML IDs for slides.
+
+0.9.10.2
+  * More robust static content generation--don't prematurely fail if a file
+    isn't found.
+  * Fixed some form generation regular expressions on Ruby 1.8.
+
+0.9.10.1
+  * Continuing on in the grand tradition of rapid point releases, this is
+    a minor, yet important, errata fix. Current versions of RedCarpet did
+    not work with both instructor notes and `:strikethrough` enabled. This
+    release turns `:strikethrough` back off and a future update will rework
+    the syntax for instructor notes.
+  * Enables static supplemental material generation
+  * Output cleaner HTML
+  * Allows running without a `showoff.json` config file again.
+
+0.9.10
+  * Fresh coat of paint on the presenter view. This uses the CSS3 flexbox
+    model, so it's much cleaner and will allow more UI work in the future.
+    (thanks to @jolshevski for some of the UI cleanup)
+  * Slide menu in the presenter view now follows the current slide.
+  * Audience questions can now be dismissed by clicking on them.
+  * Smartphone remote view simplified, now with hamburger menu button.
+  * Enables more Markdown extensions such as:
+    * `autolink`: automatically recognize links
+    * `definition_lists`: PHP-Markdown style definition lists
+    * `no_intra_emphasis`: mid-word underscores don't screw up formatting
+    * `strikethrough`: surround words with `~~` to strikethrough
+    * `superscript`: superscript text using `^`
+    * `tables`: PHP-Markdown style tables
+    * `underline`: Use underscores for underline instead of emphasis
+
+These defaults are documented in AUTHORING.rdoc and can be disabled with some
+variation of this in your `showoff.json` file:
+
+    "redcarpet" : {
+      "autolink"          : false,
+      "no_intra_emphasis" : false,
+      "strikethrough"     : false,
+      "superscript"       : false,
+      "tables"            : false,
+      "underline"         : false
+    }
+
+0.9.9.1
+  * Fix `showoff static` again.
+
+0.9.9
+  * Added HTML form support
+  * Fixed paging bug
+  * Handle trailing slash in presenter view properly
+
+0.9.8.1
+  * fix thin dependency so prerelease isn't pulled in
+  * add nicer usage messaging
+
+0.9.8
+  Merged in several community contributions and added some new features.
+
+  * Add favicon support (@raphink and @jamtur01)
+  * Add Docker syntax highlighting (@jamtur01)
+  * Add ability to link to named slides
+  * Added popup next slide view (@WhatsARanjit)
+  * Reinstate ability to host multiple presentations at once (@jcoglan)
+  * Added a code review workflow allowing quick material updates.
+
+0.9.7.1
+  Changed slave window popup behavior to work better with Chrome's popup
+  handling.
+
+0.9.7
+  Merged in fixes and new features from upstream in preparation for taking
+  over maintainership. I tried to keep attribution wherever I could, but
+  I had to massage several commits, and had to re-implement a couple.
+
+  New features:
+
+  * Allows one to set a custom per slide background
+  * Adds gherkin syntax highlighting
+  * Adds support for the Kramdown markdown engine
+  * Allows one to set markdown engine configuration options in showoff.json
+
+  If you notice any regressions please file issues and we'll get them fixed.
+
+0.9.6
+  Ports client communication to websockets
+  Adds audience interaction
+    Pace feedback, slower/faster
+    Ask a question
+    Provide slide feedback

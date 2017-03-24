@@ -15,14 +15,19 @@ var incrCurr = 0
 var incrCode = false
 var debugMode = false
 var gotoSlidenum = 0
+var lastMessageGuid = 0
 var shiftKeyActive = false
 var query
+var slideStartTime = new Date().getTime()
+
+var questionPrompt = 'Ask a question...'
+var feedbackPrompt = 'Why?...'
 
 var loadSlidesBool
 var loadSlidesPrefix
 
-var modeState = Object.freeze({"passive":1, "ping":2, "follow":3, "lead":4});
-var mode = modeState.ping
+var mode = { track: true, follow: false };
+
 
 function setupPreso(load_slides, prefix) {
 	if (preso_started)
@@ -37,14 +42,14 @@ function setupPreso(load_slides, prefix) {
 
 	// Load slides fetches images
 	loadSlidesBool = load_slides
-	loadSlidesPrefix = prefix
+	loadSlidesPrefix = prefix || '/'
 	loadSlides(loadSlidesBool, loadSlidesPrefix)
 
 	doDebugStuff()
 
 	// bind event handlers
 	document.onkeydown = keyDown
-	document.onkeyup = keyUp
+	document.onkeyup   = keyUp
 	/* window.onresize	= resized; */
 	/* window.onscroll = scrolled; */
 	/* window.onunload = unloaded; */
@@ -54,9 +59,56 @@ function setupPreso(load_slides, prefix) {
 		bind('swipeleft', swipeLeft).   // next
 		bind('swiperight', swipeRight); // prev
 
-  // start pinging the server
-  if(query.ping == 'false') mode = modeState.passive;
-  startActionLoop();
+  // give us the ability to disable tracking via url parameter
+  if(query.track == 'false') mode.track = false;
+
+  // make sure that the next view doesn't bugger things on the first load
+  if(query.next == 'true') {
+    $('#preso').addClass('zoomed');
+    mode.next = true;
+    zoom();
+  }
+
+  // Make sure the slides always look right.
+  // Better would be dynamic calculations, but this is enough for now.
+  $(window).resize(function(){location.reload();});
+
+  $("#feedbackWrapper").hover(
+    function() {
+      $('#feedbackSidebar').show();
+      document.onkeydown = null;
+      document.onkeyup   = null;
+    },
+    function() {
+      $('#feedbackSidebar').hide();
+      document.onkeydown = keyDown;
+      document.onkeyup   = keyUp;
+    }
+  );
+
+  $("#paceSlower").click(function() { sendPace('slower'); });
+  $("#paceFaster").click(function() { sendPace('faster'); });
+  $("#askQuestion").click(function() { askQuestion( $("textarea#question").val()) });
+  $("#sendFeedback").click(function() {
+    sendFeedback($( "input:radio[name=rating]:checked" ).val(), $("textarea#feedback").val())
+  });
+  $("#editSlide").click(function() { editSlide(); });
+
+  $("textarea#question").val(questionPrompt);
+  $("textarea#feedback").val(feedbackPrompt);
+  $("textarea#question").focus(function() { clearIf($(this), questionPrompt) });
+  $("textarea#feedback").focus(function() { clearIf($(this), feedbackPrompt) });
+
+  // Open up our control socket
+  if(mode.track) {
+    connectControlChannel();
+  }
+/*
+  ws           = new WebSocket('ws://' + location.host + '/control');
+  ws.onopen    = function()  { connected();          };
+  ws.onclose   = function()  { disconnected();       }
+  ws.onmessage = function(m) { parseMessage(m.data); };
+*/
 }
 
 function loadSlides(load_slides, prefix) {
@@ -109,7 +161,60 @@ function initializePresentation(prefix) {
 	} catch(e) {
 	    sh_highlightDocument();
 	}
+
+  $(".content form").submit(function(e) {
+    e.preventDefault();
+    submitForm($(this));
+  });
+
+  // suspend hotkey handling
+  $(".content form :input").focus( function() {
+    document.onkeydown = null;
+    document.onkeyup   = null;
+  });
+  $(".content form :input").blur( function() {
+    document.onkeydown = keyDown;
+    document.onkeyup   = keyUp;
+  });
+
+  $(".content form :input").change(function(e) {
+    enableForm($(this));
+  });
+
+  $(".content form div.tools input.display").click(function(e) {
+    try {
+      // If we're a presenter, try to bust open the slave display
+      slaveWindow.renderForm($(this).closest('form').attr('id'));
+    }
+    catch (e) {
+      console.log(e);
+      renderForm($(this).closest('form'));
+    }
+  });
+
 	$("#preso").trigger("showoff:loaded");
+}
+
+/* This looks like the zoom() function for the presenter preview, but it uses a different algorithm */
+function zoom()
+{
+  if(window.innerWidth <= 480) {
+    $(".zoomed").css("zoom", 0.32);
+  }
+  else {
+    var hSlide = parseFloat($("#preso").height());
+    var wSlide = parseFloat($("#preso").width());
+    var hBody  = parseFloat($("html").height());
+    var wBody  = parseFloat($("html").width());
+
+    newZoom = Math.min(hBody/hSlide, wBody/wSlide) - 0.04;
+
+    $(".zoomed").css("zoom", newZoom);
+    $(".zoomed").css("-ms-zoom", newZoom);
+    $(".zoomed").css("-webkit-zoom", newZoom);
+    $(".zoomed").css("-moz-transform", "scale("+newZoom+")");
+    $(".zoomed").css("-moz-transform-origin", "left top");
+  }
 }
 
 function centerSlides(slides) {
@@ -155,17 +260,35 @@ function checkSlideParameter() {
 	}
 }
 
+function currentSlideFromName(name) {
+  var count = 0;
+  if(name.length > 0 ) {
+  	slides.each(function(s, slide) {
+  	  if (name == $(slide).find(".content").attr("ref") ) {
+  	    found = count;
+  	    return false;
+  	  }
+  	  count++;
+  	});
+	}
+	return count;
+}
+
 function currentSlideFromParams() {
 	var result;
 	if (result = window.location.hash.match(/#([0-9]+)/)) {
 		return result[result.length - 1] - 1;
 	}
+	else {
+	  var hash = window.location.hash
+	  return currentSlideFromName(hash.substr(1, hash.length))
+  }
 }
 
 function setupSlideParamsCheck() {
 	var check = function() {
 		var currentSlide = currentSlideFromParams();
-		if (slidenum != currentSlide) {
+		if (!isNaN(currentSlide) && slidenum != currentSlide) {
 			slidenum = currentSlide;
 			showSlide();
 		}
@@ -175,8 +298,9 @@ function setupSlideParamsCheck() {
 }
 
 function gotoSlide(slideNum, updatepv) {
-  slidenum = parseInt(slideNum);
-  if (!isNaN(slidenum)) {
+  var newslide = parseInt(slideNum);
+  if (slidenum != newslide && !isNaN(newslide)) {
+    slidenum = newslide;
     showSlide(false, updatepv);
   }
 }
@@ -239,15 +363,39 @@ function showSlide(back_step, updatepv) {
 
 	var ret = setCurrentNotes();
 
+	var fileName = currentSlide.children().first().attr('ref');
+  $('#slideFilename').text(fileName);
+
+  if (query.next) {
+    $(currentSlide).find('li').removeClass('hidden');
+  }
+
   // Update presenter view, if we spawned one
-	if (updatepv && 'presenterView' in window) {
+	if (updatepv && 'presenterView' in window && ! mode.next) {
     var pv = window.presenterView;
 		pv.slidenum = slidenum;
     pv.incrCurr = incrCurr
     pv.incrSteps = incrSteps
 		pv.showSlide(true);
 		pv.postSlide();
+
+		pv.update();
+
 	}
+
+  // Update presenter view nav for current slide
+  $( ".menu > ul > li > ul > li" ).each(function() {
+    if ($(this).text().split(". ")[0] == slidenum+1) {
+      $(".menu > ul > li > ul ").hide();  //Collapse nav
+      $(".menu > ul > li > ul > li").removeClass('highlighted');
+      $(this).addClass('highlighted'); //Highlight current menu item
+      $(this).parent().show();         //Show nav block containing current slide
+
+      if( ! mobile() ) {
+        $(this).get(0).scrollIntoView(); //Scroll so current item is at the top of the view
+      }
+    }
+  });
 
 	return ret;
 }
@@ -294,21 +442,314 @@ function determineIncremental()
 		incrCode = true
 	}
 	incrElem.each(function(s, elem) {
-		$(elem).css('visibility', 'hidden');
+		$(elem).addClass('incremental hidden');
 	})
 }
 
 function showIncremental(incr)
 {
-		elem = incrElem.eq(incrCurr)
+		elem = incrElem.eq(incrCurr);
 		if (incrCode && elem.hasClass('command')) {
-			incrElem.eq(incrCurr).css('visibility', 'visible').jTypeWriter({duration:1.0})
+			incrElem.eq(incrCurr).removeClass('hidden').jTypeWriter({duration:1.0});
 		} else {
-			incrElem.eq(incrCurr).css('visibility', 'visible')
+			incrElem.eq(incrCurr).removeClass('hidden');
 		}
 }
 
-function prevStep()
+function clearIf(elem, val) {
+  console.log(elem.val());
+  console.log(val);
+  if(elem.val() == val ) { elem.val(''); }
+}
+
+
+// form handling
+function submitForm(form) {
+  if(validateForm(form)) {
+    var dataString = form.serialize();
+    var formAction = form.attr("action");
+
+    $.post(formAction, dataString, function( data ) {
+      var submit = form.find("input[type=submit]")
+      submit.attr("disabled", "disabled");
+      submit.removeClass("dirty");
+    });
+  }
+}
+
+function validateForm(form) {
+  var success = true;
+
+  form.children('div.form.element.required').each(function() {
+    var count  = $(this).find(':input:checked').length;
+    var value  = $.trim($(this).children('input:text, textarea, select').first().val());
+
+    // if we have no checked inputs or content, then flag it
+    if(count || (value && value)) {
+      $(this).closest('div.form.element').removeClass('warning');
+    }
+    else {
+      $(this).closest('div.form.element').addClass('warning');
+      success = false;
+    }
+
+  });
+
+  return success;
+}
+
+function enableForm(element) {
+  var submit = element.closest('form').find(':submit')
+  submit.removeAttr("disabled");
+  submit.addClass("dirty")
+}
+
+function renderFormWatcher(element) {
+  var form = element.attr('title');
+  var action = $('.content form#'+form).attr('action');
+
+  element.empty();
+  element.attr('action', action); // yes, we're putting an action on a div. Sue me.
+  $('.content form#'+form+' div.form.element').each(function() {
+    $(this).clone().appendTo(element);
+  });
+
+  renderForm(element);
+  // short pause to let the form be rebuilt. Prevents screen flashing.
+  setTimeout(function() { element.show(); }, 100);
+  return setInterval(function() { renderForm(element); }, 3000);
+}
+
+function renderForm(form) {
+  if(typeof(form) == 'string') {
+    form = $('form#'+form);
+  }
+  var action = form.attr("action");
+  $.getJSON(action, function( data ) {
+    //console.log(data);
+    form.children('div.form.element').each(function() {
+      var key = $(this).attr('data-name');
+      var sum = 0;
+
+      $(this).find('ul > li > *').each(function() {
+        $(this).parent().parent().before(this);
+      });
+      $(this).children('ul').each(function() {
+        $(this).remove();
+      });
+
+      // replace all input widgets with spans for the bar chart
+      var max   = 5;
+      var style = 0;
+      $(this).children(':input').each(function() {
+        switch( $(this).attr('type') ) {
+          case 'text':
+          case 'button':
+          case 'submit':
+          case 'textarea':
+            // we don't render these
+            $(this).parent().remove();
+            break;
+
+          case 'radio':
+          case 'checkbox':
+            // Just render these directly and migrate the label to inside the span
+            var value = $(this).attr('value');
+            var label = $(this).next('label');
+            var text  = label.text();
+
+            if(text.match(/^-+$/)) {
+              $(this).remove();
+            }
+            else{
+              $(this).replaceWith('<div class="item barstyle'+style+'" data-value="'+value+'">'+text+'</div>');
+            }
+            label.remove();
+            break;
+
+          default:
+            // select doesn't have a type attribute... yay html
+            // poke inside to get options, then render each as a span and replace the select
+            parent = $(this).parent();
+
+            $(this).children('option').each(function() {
+              var value = $(this).val();
+              var text  = $(this).text();
+
+              if(! text.match(/^-+$/)) {
+                parent.append('<div class="item barstyle'+style+'" data-value="'+value+'">'+text+'</div>');
+
+                // loop style counter
+                style++; style %= max;
+              }
+            });
+            $(this).remove();
+            break;
+        }
+
+        // loop style counter
+        style++; style %= max;
+      });
+
+      // only start counting and sizing bars if we actually have usable data
+      if(data) {
+        // double loop so we can handle re-renderings of the form
+        $(this).find('.item').each(function() {
+          var name = $(this).attr('data-value');
+
+          if(key in data) {
+            var count = data[key][name];
+            if(count) { sum += count; }
+          }
+        });
+
+
+        $(this).find('.item').each(function() {
+          var name     = $(this).attr('data-value');
+          var oldCount = $(this).attr('data-count');
+          var oldSum   = $(this).attr('data-sum');
+
+          if(key in data) {
+            var count = data[key][name] || 0;
+          }
+          else {
+            var count = 0;
+          }
+
+          if(count != oldCount || sum != oldSum) {
+            var percent = (sum) ? ((count/sum)*100)+'%' : '0%';
+
+            $(this).attr('data-count', count);
+            $(this).attr('data-sum', sum);
+            $(this).animate({width: percent});
+          }
+        });
+      }
+
+      $(this).addClass('rendered');
+    });
+
+  });
+}
+
+function connectControlChannel() {
+  ws           = new WebSocket('ws://' + location.host + '/control');
+  ws.onopen    = function()  { connected();          };
+  ws.onclose   = function()  { disconnected();       }
+  ws.onmessage = function(m) { parseMessage(m.data); };
+}
+
+// This exists as an intermediary simply so the presenter view can override it
+function reconnectControlChannel() {
+  connectControlChannel();
+}
+
+function connected() {
+  console.log('Control socket opened');
+  $("#feedbackSidebar button").attr("disabled", false);
+  $("img#disconnected").hide();
+
+  try {
+    // If we are a presenter, then remind the server where we are
+    update();
+    register();
+  }
+  catch (e) {}
+}
+
+function disconnected() {
+  console.log('Control socket closed');
+  $("#feedbackSidebar button").attr("disabled", true);
+  $("img#disconnected").show();
+
+  setTimeout(function() { reconnectControlChannel() } , 5000);
+}
+
+function parseMessage(data) {
+  var command = JSON.parse(data);
+
+  if ("id" in command) {
+    var guid = command['id'];
+    if (lastMessageGuid != guid) {
+      lastMessageGuid = guid;
+    }
+    else {
+      return;
+    }
+  }
+
+  if ("current" in command) { follow(command["current"]); }
+
+  // Presenter messages only, so catch errors if method doesn't exist
+  try {
+    if ("pace"     in command) { paceFeedback(command["pace"]);     }
+    if ("question" in command) {  askQuestion(command["question"]); }
+  }
+  catch(e) {
+    console.log("Not a presenter!");
+  }
+}
+
+function sendPace(pace) {
+  ws.send(JSON.stringify({ message: 'pace', pace: pace}));
+  feedbackActivity();
+}
+
+function askQuestion(question) {
+  ws.send(JSON.stringify({ message: 'question', question: question}));
+  $("textarea#question").val(questionPrompt);
+  feedbackActivity();
+}
+
+function sendFeedback(rating, feedback) {
+  var slide  = $("#slideFilename").text();
+  ws.send(JSON.stringify({ message: 'feedback', rating: rating, feedback: feedback, slide: slide}));
+  $("textarea#feedback").val(feedbackPrompt);
+  $("input:radio[name=rating]:checked").attr('checked', false);
+  feedbackActivity();
+}
+
+function feedbackActivity() {
+  $("img#feedbackActivity").show();
+  setTimeout(function() { $("img#feedbackActivity").hide() }, 1000);
+}
+
+function track() {
+  if (mode.track) {
+    var slideName    = $("#slideFilename").text();
+    var slideEndTime = new Date().getTime();
+    var elapsedTime  = slideEndTime - slideStartTime;
+
+    // reset the timer
+    slideStartTime = slideEndTime;
+
+    if (elapsedTime > 1000) {
+      elapsedTime /= 1000;
+      ws.send(JSON.stringify({ message: 'track', slide: slideName, time: elapsedTime}));
+    }
+  }
+}
+
+// Open a new tab with an online code editor, if so configured
+function editSlide() {
+  var slide = $("span#slideFilename").text().replace(/\/\d+$/, '');
+  var link  = editUrl + slide + ".md";
+  window.open(link);
+}
+
+function follow(slide) {
+  if (mode.follow) {
+    console.log("New slide: " + slide);
+    gotoSlide(slide);
+  }
+}
+
+function getPosition() {
+  // get the current position from the server
+  ws.send(JSON.stringify({ message: 'position' }));
+}
+
+function prevStep(updatepv)
 {
 	var event = jQuery.Event("showoff:prev");
 	$(currentSlide).find(".content").trigger(event);
@@ -316,11 +757,13 @@ function prevStep()
 			return;
 	}
 
+  track();
+
 	slidenum--
-	return showSlide(true) // We show the slide fully loaded
+	return showSlide(true, updatepv) // We show the slide fully loaded
 }
 
-function nextStep()
+function nextStep(updatepv)
 {
 	var event = jQuery.Event("showoff:next");
 	$(currentSlide).find(".content").trigger(event);
@@ -328,9 +771,11 @@ function nextStep()
 			return;
 	}
 
+	track();
+
 	if (incrCurr >= incrSteps) {
 		slidenum++
-		return showSlide()
+		return showSlide(false, updatepv)
 	} else {
 		showIncremental(incrCurr);
 		var incrEvent = jQuery.Event("showoff:incr");
@@ -344,14 +789,11 @@ function nextStep()
 function doDebugStuff()
 {
 	if (debugMode) {
-		$('#debugInfo').show()
-        $('.slide .content').each(function(index) {
-            $(this).prepend('<div id="debugFilename">' + $(this).attr('ref') + '</div>');
-        });
-		debug('debug mode on')
+	  $('#debugInfo').show();
+		$('#slideFilename').show();
 	} else {
-		$('#debugInfo').hide()
-		$('.content #debugFilename').remove()
+	  $('#debugInfo').hide();
+		$('#slideFilename').hide();
 	}
 }
 
@@ -379,42 +821,16 @@ function toggleNotes()
 	}
 }
 
-function defaultMode() {
-  return (query.ping == 'false') ? modeState.passive : modeState.ping;
-}
-
 function toggleFollow()
 {
-  mode = (mode == modeState.follow) ? defaultMode() : modeState.follow;
+  mode.follow = ! mode.follow;
 
-  if(mode == modeState.follow) {
+  if(mode.follow) {
     $("#followMode").show().text('Follow Mode:');
+    getPosition();
   } else {
     $("#followMode").hide();
   }
-}
-
-function toggleLeader()
-{
-  mode = (mode == modeState.lead) ? defaultMode() : modeState.lead;
-
-  if(mode == modeState.lead) {
-    $("#followMode").show().text('Leader Mode:');
-  } else {
-    $("#followMode").hide();
-  }
-}
-
-// just splats up an indicator that we're following a remote
-function toggleRemote()
-{
-  try {
-    if(window.presenterView.mode == modeState.follow) {
-      $("#followMode").show().text('Remote Mode:');
-    } else {
-      $("#followMode").hide();
-    }
-  } catch(e) {}
 }
 
 function executeAnyCode()
@@ -442,9 +858,6 @@ function debug(data)
 function keyDown(event)
 {
 	var key = event.keyCode;
-
-	// if we're a slave window, reset the master timeout
-	try { window.presenterView.resetModeTimer() } catch (e) {}
 
 	if (event.ctrlKey || event.altKey || event.metaKey)
 		return true;
@@ -879,42 +1292,6 @@ function StyleListMenuItem(t)
 
 
 /********************
- Analytics and Follower
- ********************/
-
-function startActionLoop()
-{
-  // The ping() function tells the server which page we are on.
-  // The hostname is recorded to keep track of how much time viewers spend on each slide.
-  //
-  // If follow mode is enabled, then call getpage() to go to the page the presenter is on.
-  //
-  // If we are leading, then just send the current page to the server, along with a key if set.
-  var action = function() {
-    switch(mode) {
-      case modeState.passive:
-        console.log('no op');
-        break;
-      case modeState.ping:
-        console.log('ping!');
-        $.get("/ping", { page: slidenum } );
-        break;
-      case modeState.follow:
-        console.log('follow');
-        $.get("/getpage", function(data) { gotoSlide(data); });
-        break;
-      case modeState.lead:
-        console.log('lead');
-        $.get("/update", { page: slidenum, key: query.key } );
-        break;
-    }
-	}
-
-	$.ajaxSetup({ timeout: 1000 });
-	actionLoop = setInterval(action, 1000);
-}
-
-/********************
  Stats page
  ********************/
 
@@ -924,4 +1301,20 @@ function setupStats()
   $("#stats div#all div.row").click(function() {
       $(this).find("div.detail").slideToggle("fast");
   });
+}
+
+/* Is this a mobile device? */
+function mobile() {
+/*
+  return ( navigator.userAgent.match(/Android/i)
+            || navigator.userAgent.match(/webOS/i)
+            || navigator.userAgent.match(/iPhone/i)
+            || navigator.userAgent.match(/iPad/i)
+            || navigator.userAgent.match(/iPod/i)
+            || navigator.userAgent.match(/BlackBerry/i)
+            || navigator.userAgent.match(/Windows Phone/i)
+  );
+*/
+
+  return ( $(window).width() <= 480 )
 }

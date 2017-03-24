@@ -4,6 +4,8 @@ require 'json'
 require 'nokogiri'
 require 'fileutils'
 require 'logger'
+require 'htmlentities'
+require 'sinatra-websocket'
 
 here = File.expand_path(File.dirname(__FILE__))
 require "#{here}/showoff_utils"
@@ -12,13 +14,13 @@ require "#{here}/commandline_parser"
 begin
   require 'RMagick'
 rescue LoadError
-  $stderr.puts 'WARN: image sizing disabled - install rmagick'
+  # nop
 end
 
 begin
   require 'pdfkit'
 rescue LoadError
-  $stderr.puts 'WARN: pdf generation disabled - install pdfkit'
+  # nop
 end
 
 require 'tilt'
@@ -27,24 +29,37 @@ class ShowOff < Sinatra::Application
 
   attr_reader :cached_image_size
 
+  # Set up application variables
+
   set :views, File.dirname(__FILE__) + '/../views'
   set :public_folder, File.dirname(__FILE__) + '/../public'
 
+  set :statsdir, "stats"
+  set :viewstats, "viewstats.json"
+  set :feedback, "feedback.json"
+  set :forms, "forms.json"
+
+  set :server, 'thin'
+  set :sockets, []
+  set :presenters, []
+
   set :verbose, false
+  set :review, false
+
   set :pres_dir, '.'
   set :pres_file, 'showoff.json'
   set :page_size, "Letter"
   set :pres_template, nil
-  set :showoff_config, nil
-  set :downloads, nil
-  set :counter, nil
-  set :current, 0
+  set :showoff_config, {}
+  set :encoding, nil
 
   def initialize(app=nil)
     super(app)
     @logger = Logger.new(STDOUT)
     @logger.formatter = proc { |severity,datetime,progname,msg| "#{progname} #{msg}\n" }
     @logger.level = settings.verbose ? Logger::DEBUG : Logger::WARN
+
+    @review = settings.review
 
     dir = File.expand_path(File.join(File.dirname(__FILE__), '..'))
     @logger.debug(dir)
@@ -64,7 +79,8 @@ class ShowOff < Sinatra::Application
       showoff_json = JSON.parse(File.read(ShowOffUtils.presentation_config_file))
       settings.showoff_config = showoff_json
 
-      # Set options for template and page size
+      # Set options for encoding, template and page size
+      settings.encoding = showoff_json["encoding"]
       settings.page_size = showoff_json["page-size"] || "Letter"
       settings.pres_template = showoff_json["templates"]
     end
@@ -79,17 +95,29 @@ class ShowOff < Sinatra::Application
     # Default asset path
     @asset_path = "./"
 
-    # Track downloadable files
-    @@downloads = Hash.new
+    # Create stats directory
+    FileUtils.mkdir settings.statsdir unless File.directory? settings.statsdir
 
-    # Page view time accumulator
-    @@counter = Hash.new
+    # Page view time accumulator. Tracks how often slides are viewed by the audience
+    begin
+      @@counter = JSON.parse(File.read("#{settings.statsdir}/#{settings.viewstats}"))
+    rescue
+      @@counter = Hash.new
+    end
 
-    # The current slide that the presenter is viewing
-    @@current = 0
+    # keeps track of form responses. In memory to avoid concurrence issues.
+    begin
+      @@forms = JSON.parse(File.read("#{settings.statsdir}/#{settings.forms}"))
+    rescue
+      @@forms = Hash.new
+    end
+
+    @@downloads = Hash.new # Track downloadable files
+    @@cookie    = nil      # presenter cookie. Identifies the presenter for control messages
+    @@current   = Hash.new # The current slide that the presenter is viewing
 
     # Initialize Markdown Configuration
-    #MarkdownConfig::setup(settings.pres_dir)
+    MarkdownConfig::setup(settings.pres_dir)
   end
 
   def self.pres_dir_current
@@ -128,19 +156,18 @@ class ShowOff < Sinatra::Application
 
     # todo: move more behavior into this class
     class Slide
-      attr_reader :classes, :text, :tpl
+      attr_reader :classes, :text, :tpl, :bg
       def initialize( context = "")
 
         @tpl = "default"
-        @classes = ["content"]
+        @classes = []
 
         # Parse the context string for options and content classes
         if context and context.match(/(\[(.*?)\])?(.*)/)
-
           options = ShowOffUtils.parse_options($2)
           @tpl = options["tpl"] if options["tpl"]
+          @bg = options["bg"] if options["bg"]
           @classes += $3.strip.chomp('>').split if $3
-
         end
 
         @text = ""
@@ -154,8 +181,14 @@ class ShowOff < Sinatra::Application
       end
     end
 
+    def process_markdown(name, content, opts={:static=>false, :pdf=>false, :print=>false, :toc=>false, :supplemental=>nil})
+      if settings.encoding and content.respond_to?(:force_encoding)
+        content.force_encoding(settings.encoding)
+      end
+      engine_options = ShowOffUtils.showoff_renderer_options(settings.pres_dir)
+      @logger.debug "renderer: #{Tilt[:markdown].name}"
+      @logger.debug "render options: #{engine_options.inspect}"
 
-    def process_markdown(name, content, opts={:static=>false, :pdf=>false, :supplemental=>nil})
       # if there are no !SLIDE markers, then make every H1 define a new slide
       unless content =~ /^\<?!SLIDE/m
         content = content.gsub(/^# /m, "<!SLIDE>\n# ")
@@ -176,7 +209,7 @@ class ShowOff < Sinatra::Application
         end
       end
 
-      slides.delete_if {|slide| slide.empty? }
+      slides.delete_if {|slide| slide.empty? and not slide.bg }
 
       final = ''
       if slides.size > 1
@@ -198,6 +231,19 @@ class ShowOff < Sinatra::Application
           next if slide.classes.include? 'supplemental'
         end
 
+        unless opts[:toc]
+          # just drop the slide if we're not generating a table of contents
+          next if slide.classes.include? 'toc'
+        end
+
+        if opts[:print]
+          # drop all slides not intended for the print version
+          next if slide.classes.include? 'noprint'
+        else
+          # drop slides that are intended for the print version only
+          next if slide.classes.include? 'printonly'
+        end
+
         @slide_count += 1
         content_classes = slide.classes
 
@@ -207,10 +253,13 @@ class ShowOff < Sinatra::Application
         # extract id, defaulting to none
         id = nil
         content_classes.delete_if { |x| x =~ /^#([\w-]+)/ && id = $1 }
+        id = name.dup unless id
+        id.gsub!(/[^-A-Za-z0-9_]/, '_') # valid HTML id characters
         @logger.debug "id: #{id}" if id
         @logger.debug "classes: #{content_classes.inspect}"
         @logger.debug "transition: #{transition}"
         @logger.debug "tpl: #{slide.tpl} " if slide.tpl
+        @logger.debug "bg: #{slide.bg}" if slide.bg
 
 
         template = "~~~CONTENT~~~"
@@ -225,23 +274,26 @@ class ShowOff < Sinatra::Application
         end
 
         # create html for the slide
+        classes = content_classes.join(' ')
         content = "<div"
         content += " id=\"#{id}\"" if id
-        content += " class=\"slide\" data-transition=\"#{transition}\">"
+        content += " style=\"background-image: url('file/#{slide.bg}');\"" if slide.bg
+        content += " class=\"slide #{classes}\" data-transition=\"#{transition}\">"
 
         # name the slide. If we've got multiple slides in this file, we'll have a sequence number
         # include that sequence number to index directly into that content
         if seq
-          content += "<div class=\"#{content_classes.join(' ')}\" ref=\"#{name}/#{seq.to_s}\">\n"
+          content += "<div class=\"content #{classes}\" ref=\"#{name}/#{seq.to_s}\">\n"
         else
-          content += "<div class=\"#{content_classes.join(' ')}\" ref=\"#{name}\">\n"
+          content += "<div class=\"content #{classes}\" ref=\"#{name}\">\n"
         end
 
         # Apply the template to the slide and replace the key to generate the content of the slide
         sl = process_content_for_replacements(template.gsub(/~~~CONTENT~~~/, slide.text))
-        sl = Tilt[:markdown].new { sl }.render
+        sl = Tilt[:markdown].new(nil, nil, engine_options) { sl }.render
+        sl = build_forms(sl, content_classes)
         sl = update_p_classes(sl)
-        sl = process_content_for_section_tags(sl)
+        sl = process_content_for_section_tags(sl, name)
         sl = update_special_content(sl, @slide_count, name) # TODO: deprecated
         sl = update_image_paths(name, sl, opts)
 
@@ -272,6 +324,9 @@ class ShowOff < Sinatra::Application
       # scan for pagebreak tags. Should really only be used for handout notes or supplemental materials
       result.gsub!("~~~PAGEBREAK~~~", '<div class="break">continued...</div>')
 
+      # replace with form rendering placeholder
+      result.gsub!(/~~~FORM:([^~]*)~~~/, '<div class="form wrapper" title="\1"></div>')
+
       # Now check for any kind of options
       content.scan(/(~~~CONFIG:(.*?)~~~)/).each do |match|
         result.gsub!(match[0], settings.showoff_config[match[1]]) if settings.showoff_config.key?(match[1])
@@ -279,7 +334,9 @@ class ShowOff < Sinatra::Application
 
       # Load and replace any file tags
       content.scan(/(~~~FILE:([^:]*):?(.*)?~~~)/).each do |match|
-        file = File.read(File.join(settings.pres_dir, '_files', match[1]))
+        # get the file content and parse out html entities
+        file = HTMLEntities.new.encode(File.read(File.join(settings.pres_dir, '_files', match[1])))
+
         # make a list of sh_highlight classes to include
         css  = match[2].split.collect {|i| "sh_#{i.downcase}" }.join(' ')
 
@@ -290,7 +347,7 @@ class ShowOff < Sinatra::Application
     end
 
     # replace section tags with classed div tags
-    def process_content_for_section_tags(content)
+    def process_content_for_section_tags(content, name = nil)
       return unless content
 
       # because this is post markdown rendering, we may need to shift a <p> tag around
@@ -302,17 +359,218 @@ class ShowOff < Sinatra::Application
       result.gsub!(/(<p>)?~~~SECTION:([^~]*)~~~/, '<div class="\2">\1')
       result.gsub!(/~~~ENDSECTION~~~(<\/p>)?/, '\1</div>')
 
+      filename = File.join(settings.pres_dir, '_notes', "#{name}.md")
+      @logger.debug "personal notes filename: #{filename}"
+      if File.file? filename
+        # TODO: shouldn't have to reparse config all the time
+        engine_options = ShowOffUtils.showoff_renderer_options(settings.pres_dir)
+
+        doc = Nokogiri::HTML::DocumentFragment.parse(result)
+        doc.css('div.notes').each do |section|
+          text = Tilt[:markdown].new(nil, nil, engine_options) { File.read(filename) }.render
+          frag = "<div class=\"personal\"><h1>Personal Notes</h1>#{text}</div>"
+          note = Nokogiri::HTML::DocumentFragment.parse(frag)
+
+          if section.children.size > 0
+            section.children.before(note)
+          else
+            section.add_child(note)
+          end
+        end
+        result = doc.to_html
+      end
       result
     end
 
-    def process_content_for_all_slides(content, num_slides)
-      content.gsub("~~~NUM_SLIDES~~~", num_slides.to_s)
-    end
+    def process_content_for_all_slides(content, num_slides, opts={})
+      content.gsub!("~~~NUM_SLIDES~~~", num_slides.to_s)
 
+      # Should we build a table of contents?
+      if opts[:toc]
+        frag = Nokogiri::HTML::DocumentFragment.parse ""
+        toc = Nokogiri::XML::Node.new('div', frag)
+        toc['id'] = 'toc'
+        frag.add_child(toc)
+
+        Nokogiri::HTML(content).css('div.subsection > h1').each do |section|
+          entry = Nokogiri::XML::Node.new('div', frag)
+          entry['class'] = 'tocentry'
+          toc.add_child(entry)
+
+          link = Nokogiri::XML::Node.new('a', frag)
+          link['href'] = "##{section.parent.parent['id']}"
+          link.content = section.content
+          entry.add_child(link)
+        end
+
+        # swap out the tag, if found, with the table of contents
+        content.gsub!("~~~TOC~~~", frag.to_html)
+      end
+
+      content
+    end
 
     # find any lines that start with a <p>.(something) and turn them into <p class="something">
     def update_p_classes(markdown)
       markdown.gsub(/<p>\.(.*?) /, '<p class="\1">')
+    end
+
+    # replace custom markup with html forms
+    def build_forms(content, classes=[])
+      title = classes.collect { |cl| $1 if cl =~ /^form=(\w+)$/ }.compact.first
+      # only process slides marked as forms
+      return content if title.nil?
+
+      begin
+        tools =  '<div class="tools">'
+        tools << '<input type="button" class="display" value="Display Results">'
+        tools << '<input type="submit" value="Save" disabled="disabled">'
+        tools << '</div>'
+        form  = "<form id='#{title}' action='/form/#{title}' method='POST'>#{content}#{tools}</form>"
+        doc = Nokogiri::HTML::DocumentFragment.parse(form)
+        doc.css('p').each do |p|
+          if p.text =~ /^(\w*) ?(?:->)? ?([^\*]*)? ?(\*?)= ?(.*)?$/
+            code     = $1
+            id       = "#{title}_#{code}"
+            name     = $2.empty? ? code : $2
+            required = ! $3.empty?
+            rhs      = $4
+
+            p.replace form_element(id, code, name, required, rhs, p.text)
+          end
+        end
+        doc.to_html
+      rescue Exception => e
+        @logger.warn "Form parsing failed: #{e.message}"
+        @logger.debug "Backtrace:\n\t#{e.backtrace.join("\n\t")}"
+        content
+      end
+    end
+
+    def form_element(id, code, name, required, rhs, text)
+      required = required ? 'required' : ''
+      str =  "<div class='form element #{required}' id='#{id}' data-name='#{code}'>"
+      str << "<label for='#{id}'>#{name}</label>"
+      case rhs
+      when /^\[\s+(\d*)\]$$/             # value = [    5]                                    (textarea)
+        str << form_element_textarea(id, code, $1)
+      when /^___+(?:\[(\d+)\])?$/        # value = ___[50]                                    (text)
+        str << form_element_text(id, code, $1)
+      when /^\(x?\)/                     # value = (x) option one () opt2 () opt3 -> option 3 (radio)
+        str << form_element_radio(id, code, rhs.scan(/\((x?)\)\s*([^()]+)\s*/))
+      when /^\[x?\]/                     # value = [x] option one [] opt2 [] opt3 -> option 3 (checkboxes)
+        str << form_element_checkboxes(id, code, rhs.scan(/\[(x?)\] ?([^\[\]]+)/))
+      when /^\{(.*)\}$/                  # value = {BOS, SFO, (NYC)}                          (select shorthand)
+        str << form_element_select(id, code, rhs.scan(/\(?\w+\)?/))
+      when /^\{$/                        # value = {                                          (select)
+        str << form_element_select_multiline(id, code, text)
+      when ''                            # value =                                            (radio/checkbox list)
+        str << form_element_multiline(id, code, text)
+      else
+        @logger.warn "Unmatched form element: #{rhs}"
+      end
+      str << '</div>'
+    end
+
+    def form_element_text(id, code, length)
+      "<input type='text' id='#{id}_response' name='#{code}' size='#{length}' />"
+    end
+
+    def form_element_textarea(id, code, rows)
+      rows = 3 if rows.empty?
+      "<textarea id='#{id}_response' name='#{code}' rows='#{rows}'></textarea>"
+    end
+
+    def form_element_radio(id, code, items)
+      form_element_check_or_radio_set('radio', id, code, items)
+    end
+
+    def form_element_checkboxes(id, code, items)
+      form_element_check_or_radio_set('checkbox', id, code, items)
+    end
+
+    def form_element_select(id, code, items)
+      str =  "<select id='#{id}_response' name='#{code}'>"
+      str << '<option value="">----</option>'
+
+      items.each do |item|
+        if item =~ /\((\w+)\)/
+          item     = $1
+          selected = 'selected'
+        else
+          selected = ''
+        end
+        str << "<option value='#{item}' #{selected}>#{item}</option>"
+      end
+      str << '</select>'
+    end
+
+    def form_element_select_multiline(id, code, text)
+      str =  "<select id='#{id}_response' name='#{code}'>"
+      str << '<option value="">----</option>'
+
+      text.split("\n")[1..-1].each do |item|
+        case item
+        when /^   +\((\w+) -> (.+)\),?$/         # (NYC -> New York City)
+          str << "<option value='#{$1}' selected>#{$2}</option>"
+        when /^   +(\w+) -> (.+),?$/             # NYC -> New, York City
+          str << "<option value='#{$1}'>#{$2}</option>"
+        when /^   +\((.+)[^,],?$/                # (Boston)
+          str << "<option value='#{$1}' selected>#{$1}</option>"
+        when /^   +([^\(].+[^\),]),?$/           # Boston
+          str << "<option value='#{$1}'>#{$1}</option>"
+        end
+      end
+      str << '</select>'
+    end
+
+    def form_element_multiline(id, code, text)
+      str = '<ul>'
+
+      text.split("\n")[1..-1].each do |item|
+        case item
+        when /\((x?)\)\s*(\w+)\s*(?:->\s*(.*)?)?/
+          checked = $1.empty? ? '': "checked='checked'"
+          type  = 'radio'
+          value = $2
+          label = $3 || $2
+        when /\[(x?)\]\s*(\w+)\s*(?:->\s*(.*)?)?/
+          checked = $1.empty? ? '': "checked='checked'"
+          type  = 'checkbox'
+          value = $2
+          label = $3 || $2
+        end
+
+        str << '<li>'
+        str << form_element_check_or_radio(type, id, code, value, label, checked)
+        str << '</li>'
+      end
+      str << '</ul>'
+    end
+
+    def form_element_check_or_radio_set(type, id, code, items)
+      str = ''
+      items.each do |item|
+        checked = item[0].empty? ? '': "checked='checked'"
+
+        if item[1] =~ /^(\w*) -> (.*)$/
+          value = $1
+          label = $2
+        else
+          value = label = item[1]
+        end
+
+        str << form_element_check_or_radio(type, id, code, value, label, checked)
+      end
+      str
+    end
+
+    def form_element_check_or_radio(type, id, code, value, label, checked)
+      # yes, value and id are conflated, because this is the id of the parent widget
+
+      name = (type == 'checkbox') ? "#{code}[]" : code
+      str  =  "<input type='#{type}' name='#{name}' id='#{id}_#{value}' value='#{value}' #{checked} />"
+      str << "<label for='#{id}_#{value}'>#{label}</label>"
     end
 
     # TODO: deprecated
@@ -388,7 +646,7 @@ class ShowOff < Sinatra::Application
     if defined?(Magick)
       def get_image_size(path)
         if !cached_image_size.key?(path)
-          img = Magick::Image.ping(File.join(".", @asset_path, path)).first
+          img = Magick::Image.ping(path).first
           # don't set a size for svgs so they can expand to fit their container
           if img.mime_type == 'image/svg+xml'
             cached_image_size[path] = [nil, nil]
@@ -404,7 +662,7 @@ class ShowOff < Sinatra::Application
     end
 
     def update_commandline_code(slide)
-      html = Nokogiri::XML.parse(slide)
+      html = Nokogiri::HTML::DocumentFragment.parse(slide)
       parser = CommandlineParser.new
 
       html.css('pre').each do |pre|
@@ -446,10 +704,10 @@ class ShowOff < Sinatra::Application
         end
         transform.apply(tree)
       end
-      html.root.to_s
+      html.to_html
     end
 
-    def get_slides_html(opts={:static=>false, :pdf=>false, :supplemental=>nil})
+    def get_slides_html(opts={:static=>false, :pdf=>false, :toc=>false, :supplemental=>nil})
       @slide_count   = 0
       @section_major = 0
       @section_minor = 0
@@ -469,12 +727,17 @@ class ShowOff < Sinatra::Application
             files = files.select { |f| f =~ /.md$/ }
             files.each do |f|
               fname = f.gsub(settings.pres_dir + '/', '').gsub('.md', '')
-              data << process_markdown(fname, File.read(f), opts)
+              begin
+                data << process_markdown(fname, File.read(f), opts)
+              rescue Errno::ENOENT => e
+                logger.error e.message
+                data << process_markdown(fname, "!SLIDE\n# Missing File!\n## #{fname}", opts)
+              end
             end
           end
         end
       end
-      process_content_for_all_slides(data, @slide_count)
+      process_content_for_all_slides(data, @slide_count, opts)
     end
 
     def inline_css(csses, pre = nil)
@@ -517,9 +780,8 @@ class ShowOff < Sinatra::Application
 
     def index(static=false)
       if static
-        @title = ShowOffUtils.showoff_title
+        @title = ShowOffUtils.showoff_title(settings.pres_dir)
         @slides = get_slides_html(:static=>static)
-
         @pause_msg = ShowOffUtils.pause_msg
 
         # Identify which languages to bundle for highlighting
@@ -527,10 +789,24 @@ class ShowOff < Sinatra::Application
 
         @asset_path = "./"
       end
+
+      # Display favicon in the window if configured
+      @favicon  = settings.showoff_config['favicon']
+
+      # Check to see if the presentation has enabled feedback
+      @feedback = settings.showoff_config['feedback'] unless (params && params[:feedback] == 'false')
+
+      # Provide a button in the sidebar for interactive editing if configured
+      @edit     = settings.showoff_config['edit'] if @review
+
       erb :index
     end
 
     def presenter
+      @issues    = settings.showoff_config['issues']
+      @edit      = settings.showoff_config['edit'] if @review
+      @@cookie ||= guid()
+      response.set_cookie('presenter', @@cookie)
       erb :presenter
     end
 
@@ -576,13 +852,21 @@ class ShowOff < Sinatra::Application
     end
 
     def onepage(static=false)
-      @slides = get_slides_html(:static=>static)
+      @slides = get_slides_html(:static=>static, :toc=>true)
+      @favicon = settings.showoff_config['favicon']
       #@languages = @slides.scan(/<pre class=".*(?!sh_sourceCode)(sh_[\w-]+).*"/).uniq.map{ |w| "/sh_lang/#{w[0]}.min.js"}
+      erb :onepage
+    end
+
+    def print(static=false)
+      @slides = get_slides_html(:static=>static, :toc=>true, :print=>true)
+      @favicon = settings.showoff_config['favicon']
       erb :onepage
     end
 
     def supplemental(content, static=false)
       @slides = get_slides_html(:static=>static, :supplemental=>content)
+      @favicon = settings.showoff_config['favicon']
       @wrapper_classes = ['supplemental']
       erb :onepage
     end
@@ -592,61 +876,13 @@ class ShowOff < Sinatra::Application
         shared = Dir.glob("#{settings.pres_dir}/_files/share/*").map { |path| File.basename(path) }
         # We use the icky -999 magic index because it has to be comparable for the view sort
         @downloads = { -999 => [ true, 'Shared Files', shared ] }
+        @favicon = settings.showoff_config['favicon']
       rescue Errno::ENOENT => e
         # don't fail if the directory doesn't exist
         @downloads = {}
       end
       @downloads.merge! @@downloads
       erb :download
-    end
-
-    # Called from the presenter view. Update the current slide.
-    def update()
-      if authorized?
-        slide = request.params['page'].to_i
-
-        # check to see if we need to enable a download link
-        if @@downloads.has_key?(slide)
-          @logger.debug "Enabling file download for slide #{slide}"
-          @@downloads[slide][0] = true
-        end
-
-        # update the current slide pointer
-        @logger.debug "Updated current slide to #{slide}"
-        @@current = slide
-      end
-    end
-
-    # Called once per second by each client view. Keep track of viewing stats
-    # and return the current page the instructor is showing
-    def ping()
-      slide = request.params['page'].to_i
-      remote = request.env['REMOTE_HOST']
-
-      # we only care about tracking viewing time that's not on the current slide
-      # (or on the previous slide, since we'll get at least one hit from the follower)
-      if slide != @@current and slide != @@current-1
-        # a bucket for this slide
-        if not @@counter.has_key?(slide)
-          @@counter[slide] = Hash.new
-        end
-
-        # a counter for this viewer
-        if @@counter[slide].has_key?(remote)
-          @@counter[slide][remote] += 1
-        else
-          @@counter[slide][remote] = 1
-        end
-      end
-
-      # return current slide as a string to the client
-      "#{@@current}"
-    end
-
-    # Returns the current page the instructor is showing
-    def getpage()
-      # return current slide as a string to the client
-      "#{@@current}"
     end
 
     def stats()
@@ -658,7 +894,9 @@ class ShowOff < Sinatra::Application
       @all = Hash.new
       @@counter.each do |slide, stats|
         @all[slide] = 0
-        stats.map { |host, count| @all[slide] += count }
+        stats.map do |host, visits|
+          visits.each { |entry| @all[slide] += entry['elapsed'].to_f }
+        end
       end
 
       # most and least five viewed slides
@@ -697,8 +935,10 @@ class ShowOff < Sinatra::Application
   end
 
 
-   def self.do_static(what)
-      what = "index" if !what
+   def self.do_static(args)
+      args ||= [] # handle nil arguments
+      what   = args[0] || "index"
+      opt    = args[1]
 
       # Sinatra now aliases new to new!
       # https://github.com/sinatra/sinatra/blob/v1.3.3/lib/sinatra/base.rb#L1369
@@ -708,7 +948,11 @@ class ShowOff < Sinatra::Application
       path = showoff.instance_variable_get(:@root_path)
       logger = showoff.instance_variable_get(:@logger)
 
-      data = showoff.send(what, true)
+      if what == 'supplemental'
+        data = showoff.send(what, opt, true)
+      else
+        data = showoff.send(what, true)
+      end
 
       if data.is_a?(File)
         FileUtils.cp(data.path, "#{name}.pdf")
@@ -723,7 +967,7 @@ class ShowOff < Sinatra::Application
         # Now copy all the js and css
         my_path = File.join( File.dirname(__FILE__), '..', 'public')
         ["js", "css"].each { |dir|
-          FileUtils.copy_entry("#{my_path}/#{dir}", "#{out}/#{dir}")
+          FileUtils.copy_entry("#{my_path}/#{dir}", "#{out}/#{dir}", false, false, true)
         }
         # And copy the directory
         Dir.glob("#{my_path}/#{name}/*").each { |subpath|
@@ -744,10 +988,16 @@ class ShowOff < Sinatra::Application
         }
 
         # ... and copy all needed image files
-        data.scan(/img src=[\"\'].\/file\/(.*?)[\"\']/).flatten.each do |path|
-          dir = File.dirname(path)
-          FileUtils.makedirs(File.join(file_dir, dir))
-          FileUtils.copy(File.join(pres_dir, path), File.join(file_dir, path))
+        [/img src=[\"\'].\/file\/(.*?)[\"\']/, /style=[\"\']background: url\(\'file\/(.*?)'/].each do |regex|
+          data.scan(regex).flatten.each do |path|
+            dir = File.dirname(path)
+            FileUtils.makedirs(File.join(file_dir, dir))
+            begin
+              FileUtils.copy(File.join(pres_dir, path), File.join(file_dir, path))
+            rescue Errno::ENOENT => e
+              puts "Missing source file: #{path}"
+            end
+          end
         end
         # copy images from css too
         Dir.glob("#{pres_dir}/*.css").each do |css_path|
@@ -759,7 +1009,11 @@ class ShowOff < Sinatra::Application
               logger.debug path
               dir = File.dirname(path)
               FileUtils.makedirs(File.join(file_dir, dir))
-              FileUtils.copy(File.join(pres_dir, path), File.join(file_dir, path))
+              begin
+                FileUtils.copy(File.join(pres_dir, path), File.join(file_dir, path))
+              rescue Errno::ENOENT => e
+                puts "Missing source file: #{path}"
+              end
             end
           end
         end
@@ -792,10 +1046,76 @@ class ShowOff < Sinatra::Application
     end
   end
 
+  def guid
+    # this is a terrifyingly simple GUID generator
+    (0..15).to_a.map{|a| rand(16).to_s(16)}.join
+  end
+
+  def valid_cookie
+    (request.cookies['presenter'] == @@cookie)
+  end
+
+  post '/form/:id' do |id|
+    @logger.warn("Saving form answers from ip:#{request.ip} for id:##{id}")
+
+    form = params.reject { |k,v| ['splat', 'captures', 'id'].include? k }
+
+    # make sure we've got a bucket for this form, then save our answers
+    @@forms[id] ||= {}
+    @@forms[id][request.ip] = form
+
+    form.to_json
+  end
+
+  # Return a list of the totals for each alternative for each question of a form
+  get '/form/:id' do |id|
+    return nil unless @@forms.has_key? id
+
+    @@forms[id].each_with_object({}) do |(ip,form), sum|
+      form.each do |key, val|
+        sum[key]      ||= {}
+
+        if val.class == Array
+          val.each do |item|
+            sum[key][item] ||= 0
+            sum[key][item]  += 1
+          end
+        else
+          sum[key][val] ||= 0
+          sum[key][val]  += 1
+        end
+      end
+    end.to_json
+  end
+
   get '/eval_ruby' do
     return eval_ruby(params[:code]) if ENV['SHOWOFF_EVAL_RUBY']
 
     return "Ruby Evaluation is off. To turn it on set ENV['SHOWOFF_EVAL_RUBY']"
+  end
+
+  # provide a callback to trigger a local file editor, but only when called when viewing from localhost.
+  get '/edit/*' do |path|
+    # Docs suggest that old versions of Sinatra might provide an array here, so just make sure.
+    filename = path.class == Array ? path.first : path
+    @logger.debug "Editing #{filename}"
+    return unless File.exist? filename
+
+    if request.host != 'localhost'
+      @logger.warn "Disallowing edit because #{request.host} isn't localhost."
+      return
+    end
+
+    case RUBY_PLATFORM
+    when /darwin/
+      `open #{filename}`
+    when /linux/
+      `xdg-open #{filename}`
+    when /cygwin|mswin|mingw|bccwin|wince|emx/
+      `start #{filename}`
+    else
+      @logger.warn "Cannot open #{filename}, unknown platform #{RUBY_PLATFORM}."
+    end
   end
 
   get %r{(?:image|file)/(.*)} do
@@ -808,9 +1128,117 @@ class ShowOff < Sinatra::Application
     end
   end
 
+  get '/control' do
+    if !request.websocket?
+      raise Sinatra::NotFound
+    else
+      request.websocket do |ws|
+        ws.onopen do
+          ws.send( { 'current' => @@current[:number] }.to_json )
+          settings.sockets << ws
+
+          @logger.warn "Open sockets: #{settings.sockets.size}"
+        end
+        ws.onmessage do |data|
+          begin
+            control = JSON.parse(data)
+
+            @logger.warn "#{control.inspect}"
+
+            case control['message']
+            when 'update'
+              # websockets don't use the same auth standards
+              # we use a session cookie to identify the presenter
+              if valid_cookie()
+                name  = control['name']
+                slide = control['slide'].to_i
+
+                # check to see if we need to enable a download link
+                if @@downloads.has_key?(slide)
+                  @logger.debug "Enabling file download for slide #{name}"
+                  @@downloads[slide][0] = true
+                end
+
+                # update the current slide pointer
+                @logger.debug "Updated current slide to #{name}"
+                @@current = { :name => name, :number => slide }
+
+                # schedule a notification for all clients
+                EM.next_tick { settings.sockets.each{|s| s.send({ 'current' => @@current[:number] }.to_json) } }
+              end
+
+            when 'register'
+              # save a list of presenters
+              if valid_cookie()
+                remote = request.env['REMOTE_HOST'] || request.env['REMOTE_ADDR']
+                settings.presenters << ws
+                @logger.warn "Registered new presenter: #{remote}"
+              end
+
+            when 'track'
+              remote = request.env['REMOTE_HOST'] || request.env['REMOTE_ADDR']
+              slide  = control['slide']
+              time   = control['time'].to_f
+
+              @logger.debug "Logged #{time} on slide #{slide} for #{remote}"
+
+              # a bucket for this slide
+              @@counter[slide] ||= Hash.new
+              # a bucket of slideviews for this address
+              @@counter[slide][remote] ||= Array.new
+              # and add this slide viewing to the bucket
+              @@counter[slide][remote] << { 'elapsed' => time, 'timestamp' => Time.now.to_i, 'presenter' => @@current[:name] }
+
+            when 'position'
+              ws.send( { 'current' => @@current[:number] }.to_json ) unless @@cookie.nil?
+
+            when 'pace', 'question'
+              # just forward to the presenter(s) along with a debounce in case a presenter is registered twice
+              control['id'] = guid()
+              EM.next_tick { settings.presenters.each{|s| s.send(control.to_json) } }
+
+            when 'feedback'
+              filename = "#{settings.statsdir}/#{settings.feedback}"
+              slide    = control['slide']
+              rating   = control['rating']
+              feedback = control['feedback']
+
+              begin
+                log = JSON.parse(File.read(filename))
+              rescue
+                # do nothing
+              end
+
+              log        ||= Hash.new
+              log[slide] ||= Array.new
+              log[slide]  << { :rating => rating, :feedback => feedback }
+
+              if settings.verbose then
+                File.write(filename, JSON.pretty_generate(log))
+              else
+                File.write(filename, log.to_json)
+              end
+
+            else
+              @logger.warn "Unknown message <#{control['message']}> received."
+              @logger.warn control.inspect
+            end
+
+          rescue Exception => e
+            @logger.warn "Messaging error: #{e}"
+          end
+        end
+        ws.onclose do
+          @logger.warn("websocket closed")
+          settings.sockets.delete(ws)
+        end
+      end
+    end
+  end
+
   # gawd, this whole routing scheme is bollocks
   get %r{/([^/]*)/?([^/]*)} do
-    @title = ShowOffUtils.showoff_title
+    @title = ShowOffUtils.showoff_title(settings.pres_dir)
     @pause_msg = ShowOffUtils.pause_msg
     what = params[:captures].first
     opt  = params[:captures][1]
@@ -820,20 +1248,24 @@ class ShowOff < Sinatra::Application
       protected! if settings.showoff_config['protected'].include? what
     end
 
-    # this hasn't been set to anything remotely interesting for a long time now
-    @asset_path = nil
+    @asset_path = env['SCRIPT_NAME'] == '' ? nil : env['SCRIPT_NAME'].gsub(/^\/?/, '/').gsub(/\/?$/, '/')
 
-    if (what != "favicon.ico")
-      if what == 'supplemental'
-        data = send(what, opt)
-      else
-        data = send(what)
+    begin
+      if (what != "favicon.ico")
+        if what == 'supplemental'
+          data = send(what, opt)
+        else
+          data = send(what)
+        end
+        if data.is_a?(File)
+          send_file data.path
+        else
+          data
+        end
       end
-      if data.is_a?(File)
-        send_file data.path
-      else
-        data
-      end
+    rescue NoMethodError => e
+      @logger.warn "Invalid object #{what} requested."
+      raise Sinatra::NotFound
     end
   end
 
@@ -846,8 +1278,24 @@ class ShowOff < Sinatra::Application
 
   at_exit do
     if defined?(@@counter)
-      viewstats = File.new("viewstats.json", "w")
-      viewstats.write @@counter.to_json
+      File.open("#{settings.statsdir}/#{settings.viewstats}", 'w') do |f|
+        if settings.verbose then
+          f.write(JSON.pretty_generate(@@counter))
+        else
+          f.write(@@counter.to_json)
+        end
+      end
     end
+
+    if defined?(@@forms)
+      File.open("#{settings.statsdir}/#{settings.forms}", 'w') do |f|
+        if settings.verbose then
+          f.write(JSON.pretty_generate(@@forms))
+        else
+          f.write(@@forms.to_json)
+        end
+      end
+    end
+
   end
 end

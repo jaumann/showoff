@@ -1,11 +1,20 @@
 // presenter js
 var slaveWindow = null;
+var nextWindow = null;
+var notesWindow = null;
+
+var paceData = [];
 
 $(document).ready(function(){
-  // attempt to open another window for the presentation. This may fail if
-  // popup blockers are enabled. In that case, the presenter needs to manually
-  // open the window by hitting the 'slave window' button.
+  // set up the presenter modes
+  mode = { track: true, follow: true, update: true, slave: false, next: false, notes: false};
+
+  // attempt to open another window for the presentation if the mode defaults
+  // to enabling this. It does not by default, so this is likely a no-op.
   openSlave();
+
+  // the presenter window doesn't need the reload on resize bit
+  $(window).unbind('resize');
 
   // side menu accordian crap
 	$("#preso").bind("showoff:loaded", function (event) {
@@ -14,27 +23,28 @@ $(document).ready(function(){
 			if ($(this).next().is('ul')) {
 				$(this).next().toggle()
 			} else {
-				// pause follow mode for 30 seconds
-				resetModeTimer();
-
-				gotoSlide($(this).attr('rel'))
-				try { slaveWindow.gotoSlide($(this).attr('rel')) } catch (e) {}
-				postSlide()
+				gotoSlide($(this).attr('rel'));
+				try { slaveWindow.gotoSlide($(this).attr('rel'), false) } catch (e) {}
+				postSlide();
+				update();
 			}
-			return false
-		}).next().hide()
+			return false;
+		}).next().hide();
 	});
 
-  $("#minStop").hide()
-  $("#startTimer").click(function() { toggleTimer() })
-  $("#stopTimer").click(function() { toggleTimer() })
+  $("#minStop").hide();
+  $("#startTimer").click(function() { toggleTimer() });
+  $("#stopTimer").click(function() { toggleTimer() });
 
   /* zoom slide to match preview size, then set up resize handler. */
   zoom();
   $(window).resize(function() { zoom(); });
 
   // set up tooltips
+  $('#report').tipsy({ offset: 5 });
   $('#slaveWindow').tipsy({ offset: 5 });
+  $('#nextWindow').tipsy({ offset: 5 });
+  $('#notesWindow').tipsy({ offset: 5 });
   $('#generatePDF').tipsy({ offset: 5 });
   $('#onePage').tipsy({ offset: 5, gravity: 'ne' });
 
@@ -49,27 +59,33 @@ $(document).ready(function(){
   $('#zoomer').tipsy({ gravity: 'ne' });
 
   // Bind events for mobile viewing
-  $('#preso').unbind('tap').unbind('swipeleft').unbind('swiperight');
+  if( mobile() ) {
+    $('#preso').unbind('tap').unbind('swipeleft').unbind('swiperight');
 
-  $('#preso').addSwipeEvents().
-    bind('tap', presNextStep).        // next
-    bind('swipeleft', presNextStep).  // next
-    bind('swiperight', presPrevStep); // prev
+    $('#preso').addSwipeEvents().
+      bind('tap', presNextStep).        // next
+      bind('swipeleft', presNextStep).  // next
+      bind('swiperight', presPrevStep); // prev
 
-  // set up the mode & timeout.
-  setDefaultMode();
-  resetModeTimer();
-
-  $('#remoteToggle').change( setFollowMode );
-  $('#followerToggle').change( setDefaultMode );
-
-  $('#topbar #update').click( function(e) {
-    e.preventDefault();
-    $.get("/getpage", function(data) {
-      gotoSlide(data);
+    $('#topbar #slideSource').click( function(e) {
+      $('#sidebar').toggle();
     });
-  });
 
+    $('#topbar #update').click( function(e) {
+      e.preventDefault();
+      $.get("/getpage", function(data) {
+        gotoSlide(data);
+      });
+    });
+  }
+
+  $('#remoteToggle').change( toggleFollower );
+  $('#followerToggle').change( toggleUpdater );
+
+  setInterval(function() { updatePace() }, 1000);
+
+  // Tell the showoff server that we're a presenter
+  register();
 });
 
 function popupLoader(elem, page, id, event)
@@ -86,8 +102,6 @@ function popupLoader(elem, page, id, event)
       var link = '<p class="newpage"><a href="' + page + '" target="_new">Open in new page...</a>';
       var content = '<div id="' + id + '">' + $(data).find('#wrapper').html() + link + '</div>';
 
-      console.log(content);
-
       elem.attr('title', content);
       elem.attr('open', true)
       elem.tipsy("show");
@@ -98,23 +112,196 @@ function popupLoader(elem, page, id, event)
   return false;
 }
 
+function reportIssue() {
+  var slide = $("span#slideFile").text();
+  var link  = issueUrl + encodeURIComponent('Issue with slide: ' + slide);
+  window.open(link);
+}
+
+// open browser to remote edit URL
+function editSlide() {
+  var slide = $("span#slideFile").text().replace(/\/\d+$/, '');
+  var link  = editUrl + slide + ".md";
+  window.open(link);
+}
+
+// call the edit endpoint to open up a local file editor
+function openEditor() {
+  var slide = $("span#slideFile").text().replace(/\/\d+$/, '');
+  var link  = '/edit/' + slide + ".md";
+  $.get(link);
+}
+
+function toggleSlave() {
+  mode.slave = !mode.slave;
+  openSlave();
+}
+
 function openSlave()
 {
-  try {
-    if(slaveWindow == null || typeof(slaveWindow) == 'undefined' || slaveWindow.closed){
-        slaveWindow = window.open('/?ping=false' + window.location.hash);
-    } else {
-      // maybe we need to reset content?
-      slaveWindow.location.href = '/?ping=false' + window.location.hash;
+  if (mode.slave) {
+    try {
+      if(slaveWindow == null || typeof(slaveWindow) == 'undefined' || slaveWindow.closed){
+          slaveWindow = window.open('/' + window.location.hash, 'toolbar');
+      }
+      else if(slaveWindow.location.hash != window.location.hash) {
+        // maybe we need to reset content?
+        slaveWindow.location.href = '/' + window.location.hash;
+      }
+
+      // maintain the pointer back to the parent.
+      slaveWindow.presenterView = window;
+      slaveWindow.mode = { track: false, slave: true, follow: false };
+
+      $('#slaveWindow').addClass('enabled');
+    }
+    catch(e) {
+      console.log('Failed to open or connect slave window. Popup blocker?');
     }
 
-    // maintain the pointer back to the parent.
-    slaveWindow.presenterView = window;
+    // Set up a maintenance loop to keep the connection between windows. I wish there were a cleaner way to do this.
+    if (typeof maintainSlave == 'undefined') {
+      maintainSlave = setInterval(openSlave, 1000);
+    }
   }
-  catch(e) {
-    console.log('Slave window failed to open.');
-    console.log(e);
+  else {
+    try {
+      slaveWindow && slaveWindow.close();
+      $('#slaveWindow').removeClass('enabled');
+    }
+    catch (e) {
+      console.log('Slave window failed to close properly.');
+    }
   }
+}
+
+function nextSlideNum(url) {
+  // Some fudging because the first slide is slide[0] but numbered 1 in the URL
+  console.log(typeof(url));
+  var snum;
+  if (typeof(url) == 'undefined') { snum = currentSlideFromParams()+1; }
+  else { snum = currentSlideFromParams()+2; }
+  return snum;
+}
+
+function toggleNext() {
+  mode.next = !mode.next;
+  openNext();
+}
+
+function openNext()
+{
+  if (mode.next) {
+    try {
+      if(nextWindow == null || typeof(nextWindow) == 'undefined' || nextWindow.closed){
+          nextWindow = window.open('/?track=false&feedback=false&next=true#' + nextSlideNum(true),'','width=320,height=300');
+      }
+      else if(nextWindow.location.hash != '#' + nextSlideNum(true)) {
+        // maybe we need to reset content?
+        nextWindow.location.href = '/?track=false&feedback=false&next=true#' + nextSlideNum(true);
+      }
+
+      // maintain the pointer back to the parent.
+      nextWindow.presenterView = window;
+      nextWindow.mode = { track: false, next: true, follow: true };
+
+      $('#nextWindow').addClass('enabled');
+    }
+    catch(e) {
+      console.log('Failed to open or connect next window. Popup blocker?');
+    }
+
+    // Set up a maintenance loop to keep the connection between windows. I wish there were a cleaner way to do this.
+    //if (typeof maintainNext == 'undefined') {
+    //  maintainNext = setInterval(openNext, 1000);
+    //}
+  }
+  else {
+    try {
+      nextWindow && nextWindow.close();
+      $('#nextWindow').removeClass('enabled');
+    }
+    catch (e) {
+      console.log('Next window failed to close properly.');
+    }
+  }
+}
+
+function toggleNotes() {
+  mode.notes = !mode.notes;
+  openNotes();
+}
+
+function openNotes()
+{
+  if (mode.notes) {
+    try {
+      if(notesWindow == null || typeof(notesWindow) == 'undefined' || notesWindow.closed){
+          notesWindow = window.open('', '', 'width=350,height=450');
+          postSlide();
+      }
+      $('#notesWindow').addClass('enabled');
+    }
+    catch(e) {
+      console.log('Failed to open notes window. Popup blocker?');
+    }
+  }
+  else {
+    try {
+      notesWindow && notesWindow.close();
+      $('#notesWindow').removeClass('enabled');
+    }
+    catch (e) {
+      console.log('Notes window failed to close properly.');
+    }
+  }
+}
+
+function askQuestion(question) {
+  $("#questions ul").prepend($('<li/>').text(question));
+
+  $('#questions ul li:first-child').click( function(e) {
+    $(this).remove();
+  });
+}
+
+function paceFeedback(pace) {
+  var now = new Date();
+  switch(pace) {
+    case 'faster': paceData.push({time: now, pace: -1}); break; // too fast
+    case 'slower': paceData.push({time: now, pace:  1}); break; // too slow
+  }
+
+  updatePace();
+}
+
+function updatePace() {
+  // pace notices expire in a few minutes
+  cutoff     = 3 * 60 * 1000;
+  expiration = new Date().getTime() - cutoff;
+
+  scale = 10; // this should max out around 5 clicks in either direction
+  sum   = 50; // start in the middle
+
+  // Loops through and calculates a decaying average
+  for (var index = 0; index < paceData.length; index++) {
+    notice = paceData[index]
+
+    if(notice.time < expiration) {
+      paceData.splice( index, 1 );
+    }
+    else {
+      ratio = (notice.time - expiration) / cutoff;
+      sum  += (notice.pace * scale * ratio);
+    }
+  }
+
+  position = Math.max(Math.min(sum, 90), 10); // between 10 and 90
+  console.log("Updating pace: " + position);
+  $("#paceMarker").css({ left: position+"%" });
+
+  if(position > 75) { $("#paceFast").show() } else { $("#paceFast").hide() }
+  if(position < 25) { $("#paceSlow").show() } else { $("#paceSlow").hide() }
 }
 
 function zoom()
@@ -129,9 +316,13 @@ function zoom()
     var wPreview = parseFloat($("#preview").width());
     var factor = parseFloat($("#zoomer").val());
 
-    n =  Math.min(hPreview/hSlide, wPreview/wSlide) - 0.04;
+    newZoom = factor * Math.min(hPreview/hSlide, wPreview/wSlide) - 0.04;
 
-    $(".zoomed").css("zoom", n*factor);
+    $(".zoomed").css("zoom", newZoom);
+    $(".zoomed").css("-ms-zoom", newZoom);
+    $(".zoomed").css("-webkit-zoom", newZoom);
+    $(".zoomed").css("-moz-transform", "scale("+newZoom+")");
+    $(".zoomed").css("-moz-transform-origin", "left top");
   }
 }
 
@@ -144,11 +335,54 @@ gotoSlide = function (slideNum)
     postSlide()
 }
 
+// override with an alternate implementation.
+// We need to do this before opening the websocket because the socket only
+// inherits cookies present at initialization time.
+reconnectControlChannel = function() {
+  $.ajax({
+    url: "presenter",
+    success: function() {
+      // In jQuery 1.4.2, this branch seems to be taken unconditionally. It doesn't
+      // matter though, as the disconnected() callback routes back here anyway.
+      console.log("Refreshing presenter cookie");
+      connectControlChannel();
+    },
+    error: function() {
+      console.log("Showoff server unavailable");
+      setTimeout(reconnectControlChannel(), 5000);
+    },
+  });
+}
+
+function update() {
+  if(mode.update) {
+    var slideName = $("#slideFile").text();
+    ws.send(JSON.stringify({ message: 'update', slide: slidenum, name: slideName}));
+  }
+}
+
+// Tell the showoff server that we're a presenter, giving the socket time to initialize
+function register() {
+  setTimeout( function() {
+    try {
+      ws.send(JSON.stringify({ message: 'register' }));
+    }
+    catch(e) {
+      console.log("Registration failed. Sleeping");
+      // try again, until the socket finally lets us register
+      register();
+    }
+  }, 5000);
+}
+
 function presPrevStep()
 {
-    prevStep()
-    try { slaveWindow.prevStep() } catch (e) {}
-    postSlide()
+  prevStep();
+  try { slaveWindow.prevStep(false) } catch (e) {};
+  try { nextWindow.gotoSlide(nextSlideNum()) } catch (e) {};
+  postSlide();
+
+  update();
 }
 
 function presNextStep()
@@ -158,14 +392,18 @@ function presNextStep()
     incrCurr = slaveWindow.incrCurr
     incrSteps = slaveWindow.incrSteps
 */
-	nextStep()
-	try { slaveWindow.nextStep() } catch (e) {}
-	postSlide()
+  nextStep();
+	try { slaveWindow.nextStep(false) } catch (e) {};
+  try { nextWindow.gotoSlide(nextSlideNum()) } catch (e) {};
+	postSlide();
+
+	update();
 }
 
 function postSlide()
 {
 	if(currentSlide) {
+/*
 		try {
 		  // whuuuu?
 		  var notes = slaveWindow.getCurrentNotes()
@@ -173,9 +411,24 @@ function postSlide()
 		catch(e) {
 		  var notes = getCurrentNotes()
 		}
-		var fileName = currentSlide.children().first().attr('ref')
-		$('#notes').html(notes.html())
-		$('#slideFile').text(fileName)
+*/
+    // clear out any existing rendered forms
+    try { clearInterval(renderFormInterval) } catch(e) {}
+    $('#notes div.form').empty();
+
+    var notes = getCurrentNotes();
+		$('#notes').html(notes.html());
+    if (notesWindow) {
+      $(notesWindow.document.body).html(notes.html());
+    }
+
+		var fileName = currentSlide.children().first().attr('ref');
+		$('#slideFile').text(fileName);
+
+    $("#notes div.form.wrapper").each(function(e) {
+      renderFormInterval = renderFormWatcher($(this));
+    });
+
 	}
 }
 
@@ -183,9 +436,6 @@ function postSlide()
 function keyDown(event)
 {
 	var key = event.keyCode;
-
-	// pause follow mode for 30 seconds
-	resetModeTimer();
 
 	if (event.ctrlKey || event.altKey || event.metaKey)
 		return true;
@@ -302,6 +552,7 @@ function toggleTimer()
     seconds = 0
     timerRunning = false
     totalMinutes = 0
+    setProgressColor(false)
     $("#timerInfo").text('')
     $("#minStart").show()
     $("#minStop").hide()
@@ -323,6 +574,9 @@ function setProgressColor(progress) {
   ts.removeClass('tGreen')
   ts.removeClass('tYellow')
   ts.removeClass('tRed')
+
+  if(progress === false) return;
+
   if(progress > 10) {
     ts.addClass('tBlue')
   } else if (progress > 0) {
@@ -340,52 +594,24 @@ var setCurrentStyle = function(style, prop) {
   try { slaveWindow.setCurrentStyle(style, false); } catch (e) {}
 }
 
-function mobile() {
-  return ( navigator.userAgent.match(/Android/i)
-            || navigator.userAgent.match(/webOS/i)
-            || navigator.userAgent.match(/iPhone/i)
-            || navigator.userAgent.match(/iPad/i)
-            || navigator.userAgent.match(/iPod/i)
-            || navigator.userAgent.match(/BlackBerry/i)
-            || navigator.userAgent.match(/Windows Phone/i)
-  );
-}
-
 /********************
  Follower Code
  ********************/
-function setFollowMode()
+function toggleFollower()
 {
-  console.log('starting follower');
-  if($("#remoteToggle").attr("checked")) {
-    mode = modeState.follow;
-    $("#enableRemote").addClass('active');
-  } else {
-    setDefaultMode();
-  }
-
-  try { slaveWindow.toggleRemote(); } catch(e) {};
+  mode.follow = $("#remoteToggle").attr("checked");
+  getPosition();
 }
 
+function toggleUpdater()
+{
+  mode.update = $("#followerToggle").attr("checked");
+  update();
+}
+
+/*
 // redefine defaultMode
 defaultMode = function() {
-  var defaultState = mobile() ? modeState.follow : modeState.passive;
-  return $("#followerToggle").attr("checked") ? modeState.lead : defaultState;
+  return mobile() ? modeState.follow : modeState.passive;
 }
-
-function setDefaultMode() {
-  mode = defaultMode();
-  $("#enableRemote").removeClass('active');
-  try { slaveWindow.toggleRemote(); } catch(e) {};
-}
-
-// if no action for 30 seconds, then start following
-function resetModeTimer() {
-  // we don't want the follow mode fiddled with if we're on the mobile version
-  if(mobile()) return;
-
-  console.log('reset mode timer');
-  setDefaultMode();
-  try { clearTimeout(countTimer); } catch(e) {}
-  countTimer = setTimeout(setFollowMode, 30000);
-}
+*/

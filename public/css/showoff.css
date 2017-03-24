@@ -1,4 +1,9 @@
 @media screen {
+  /* explicitly size parent elements so the screen blanker works */
+  html, body{
+    height:100%;
+  }
+
   body {
       font-size: 100%;
       font-family: "Gill Sans", Helvetica, Arial, sans-serif;
@@ -18,6 +23,13 @@
       -webkit-box-shadow:0 0 25px rgba(0,0,0,0.35);
       -moz-box-shadow:0 0 25px rgba(0,0,0,0.35);
       box-shadow:0 0 25px rgba(0,0,0,0.35);
+      background-repeat: no-repeat;
+      background-position: center;
+      background-size: cover;
+  }
+
+  #preso, .slide.background-fit {
+      background-size: contain;
   }
 
   #footer {
@@ -38,6 +50,7 @@
       border-top-left-radius: 3px;
       border-top-right-radius: 3px;
       z-index: 2147483647; /* max, see http://www.puidokas.com/max-z-index/ */
+      display: none;
   }
   #followMode {
     display: none;
@@ -60,16 +73,19 @@
 }
 
 /* plain (non-bullet) text */
-.content > p {
-	font-size: 2em;
+.content > p,
+.content > form > p {
+    font-size: 2em;
     margin: 1em;
-	text-align: center;
+    text-align: center;
 }
 
-.content > pre {
+.content > pre,
+.content > form > pre {
     font-size: 300%;
 }
-.content > blockquote {
+.content > blockquote,
+.content > form > blockquote {
     font-size: 250%;
     margin: 2em;
 }
@@ -91,9 +107,9 @@
 /* numbered lists are numbered */
 .content ol {
     margin-left: 40px;
-	font-size: 3em;
-	text-align: left;
-	padding-left: 40px;
+    font-size: 3em;
+    text-align: left;
+    padding-left: 40px;
 }
 .content ol > li {
     list-style: decimal;
@@ -102,15 +118,15 @@
 
 
 /* ironically, normal lists have bullets and 'bullets' lists don't */
-.content > ul {
+.content > ul,
+.content > form > ul {
     list-style: disc;
+    font-size: 3em;
+    text-align: left;
+    padding-left: 40px;
 }
-.content > ul {
-	font-size: 3em;
-	text-align: left;
-	padding-left: 40px;
-}
-.content > ul > li {
+.content > ul > li,
+.content > form > ul > li {
     padding: .5em;
     margin-left: 40px;
 }
@@ -134,7 +150,8 @@
 }
 
 /* nested lists get their bullets back */
-.content ul ul {
+.content ul ul,
+.content ol ul {
   list-style: disc;
   margin: 10px 10px;
   padding-left: 40px;
@@ -142,6 +159,10 @@
 }
 
 .bullets ul ul > li { font-size: 80%; }
+
+.content ul li.incremental.hidden {
+  display: none;
+}
 
 .commandline pre {
     font-size: 2em;
@@ -187,18 +208,30 @@ h3 { font-size: 2em; }
 
 pre { margin: 1em 40px; padding: .25em; }
 
+#navigation.hidden,
+#stylepicker.hidden {
+  position:absolute; top:0; left:-9999px; width:1px; height:1px; overflow:hidden;
+}
+
 .notes, .handouts, .instructor, .solguide { display: none }
-.hidden { position:absolute; top:0; left:-9999px; width:1px; height:1px; overflow:hidden; }
 .buttonNav { display: none }
 .offscreen { position:absolute; top:0; left:-9999px; overflow:hidden; }
 #debugInfo { margin-left: 30px; }
 #notesInfo { margin-left: 30px; display: none }
-#debugFilename {
-    position: absolute;
-    bottom: 5px;
-    right: 10px;
-    font-size: 12px;
+#slideFilename {
+  position: absolute;
+  right: 5px;
+  bottom: 0px;
+  height: 23px;
+  padding-left: 10px;
+  background: #ccc;
+  z-index: 2147483647;
 }
+img#disconnected {
+  float: right;
+  display: none;
+}
+
 #preshow { display: none; }
 /* define the screen blocking view */
 /* we define it as invisible because we use jQuery to animate its presentation */
@@ -219,6 +252,134 @@ pre { margin: 1em 40px; padding: .25em; }
     border-right: 2px solid #8b8;
     padding-right: 4px;
     font-weight: bold;
+}
+
+/**********************************
+ ***       Table styling        ***
+ **********************************/
+
+.content table {
+    margin-left: auto;
+    margin-right: auto;
+    border-collapse:collapse;
+    width: 80%;
+    font-size: 1.7em;
+}
+
+.content.small table {
+    font-size: 1.6em;
+    width: 90%;
+}
+.content.smaller table {
+    font-size: 1.5em;
+    width: 95%;
+}
+
+.content table th {
+    border-bottom: 2px solid #ccc;
+    padding: 0.5em;
+    font-weight: bold;
+}
+
+.content table tr td {
+    border-right: 1px solid #eee;
+    border-bottom: 1px solid #efefef;
+    text-align: center;
+    padding: 0.5em;
+}
+
+.content table tr td:last-child {
+    border-right: none;
+}
+
+.content table li {
+    list-style-type: disc;
+}
+
+
+/**********************************
+ ***      Sidebar styling       ***
+ **********************************/
+
+#feedbackWrapper {
+  float: left;
+  height: 100%;
+  position: fixed;
+  background-color: #dfdfdf;
+  opacity: 0.98;
+  z-index: 2147483647; /* max, see http://www.puidokas.com/max-z-index/ */
+}
+
+#feedbackSidebar {
+  height: 100%;
+  width: 200px;
+  background: transparent url(grippy-close.png) no-repeat right center;
+  display: none;
+}
+
+#feedbackSidebar img#feedbackActivity {
+  position: absolute;
+  right: 3px;
+  top: 3px;
+  display: none;
+}
+
+#feedbackHandle {
+  height: 100%;
+  width: 9px;
+  background: transparent url(grippy.png) no-repeat center;
+}
+
+#feedbackSidebar div.row {
+  text-align: center;
+  margin: 5px 0;
+  padding: 5px 0;
+}
+
+#feedbackWrapper h4 {
+  text-align: left;
+  margin-left: 3px;
+}
+#feedbackSidebar span.buttonWrapper {
+  height: 60px;
+  width: 85px;
+  padding: 5px;
+  display: inline-block;
+}
+#feedbackSidebar span.buttonWrapper button {
+  margin: 44px auto 0 auto;
+}
+
+#feedbackSidebar span.buttonWrapper.slower {
+  background: transparent url(slow.png) no-repeat center top;
+}
+
+#feedbackSidebar span.buttonWrapper.faster {
+  background: transparent url(fast.png) no-repeat center top;
+}
+
+#feedbackSidebar textarea {
+  height: 85px;
+  width: 85%;
+}
+
+#feedbackSidebar #disclaimer {
+  position: absolute;
+  bottom: 25px;
+  width: 100%;
+  text-align: center;
+}
+
+#feedbackSidebar div.row.tools {
+  position: absolute;
+  bottom: 30px;
+  width: 100%;
+  text-align: center;
+}
+
+#feedbackSidebar div.row > button {
+  width: 90%%;
+  margin: auto 5%;
 }
 
 .fg-menu-container {
@@ -347,6 +508,91 @@ a.fg-button { float:left; }
 }
 
 /**********************************
+ ***     table of contents      ***
+ **********************************/
+#toc a {
+  text-decoration: none;
+}
+#toc a::after {
+  content: leader(".") target-counter(attr(href), page);
+}
+
+/**********************************
+ ***       form widgets         ***
+ **********************************/
+.content div.form.element {
+    text-align: left;
+    padding-left: 40px;
+}
+.content div.form.element label {
+  margin-right: 0.5em;
+}
+.content div.form.element select {
+  font-size: 2em;
+}
+.content div.form.element textarea {
+  display: block;
+  width: 85%;
+}
+.content div.form.element ul {
+  list-style: disc;
+}
+.content div.form.element ul > li {
+  margin-left: 40px;
+}
+/* TODO: not sure why the preview window honks things up */
+#preview .content div.form.element select {
+  font-size: 0.8em;
+}
+.content div.form.element.warning {
+  background-color: #ff7373;
+}
+.content form div.tools {
+  font-size: 2em;
+}
+.content form div.tools * {
+  float: right;
+}
+.content form div.tools input[type=submit],
+.content form div.tools input[type=button] {
+  margin: 1em;
+}
+.content form div.tools input[type=submit].dirty {
+  color: red;
+}
+.content form div.tools input[type=button].display {
+  display: none;
+}
+
+div.rendered.form {
+  border: 1px solid #ccc;
+  border-radius: 0.5em;
+  margin: 1em;
+  padding: 0.25em;
+}
+div.rendered.form label {
+  display: block;
+  font-weight: bold;
+  border-bottom: 1px solid #999;
+}
+div.rendered.form .item {
+  display: block;
+  width: 0;
+/*   overflow: hidden; */
+  height: 1.25em;
+  white-space: nowrap;
+}
+div.rendered.form .item.barstyle0 { background-color: #bb73bb; }
+div.rendered.form .item.barstyle1 { background-color: #59b859; }
+div.rendered.form .item.barstyle2 { background-color: #e3742f; }
+div.rendered.form .item.barstyle3 { background-color: #4848e8; }
+div.rendered.form .item.barstyle4 { background-color: #f75d5d; }
+
+#notes .form.wrapper {
+  display: none;
+}
+
+/**********************************
  ***   supplemental materials   ***
  **********************************/
 #slides.supplemental .slide {
@@ -356,12 +602,12 @@ a.fg-button { float:left; }
   width: 8.1in;
 }
 
-.supplemental h1 { font-family: 'Arvo'; }
+.supplemental h1 { font-family: 'Arvo'; text-align: left; }
 .supplemental h2,
     .supplemental h3,
     .supplemental h4,
     .supplemental h5,
-    .supplemental h6 { font-family: 'PT Sans'; }
+    .supplemental h6 { font-family: 'PT Sans'; text-align: left; }
 
 .supplemental h1 { font-size: 2em; }
 .supplemental h2 { font-size: 1.5em; }
@@ -379,8 +625,6 @@ a.fg-button { float:left; }
   .supplemental .content > pre > code { font-size: 10pt; font-family: 'Courier New', Courier, monospace; }
 .supplemental ul { list-style: disc; margin-left: 1.25em !important; padding-left: inherit !important; }
 .supplemental .content table { font-size: 0.65em; } /* Ugly hack for tables, which never seem to scale properly. Ick */
-
-.supplemental .content div.break { font-size: small; font-style: italic; padding-bottom: 0.25em; border-bottom: 1px dashed black; }
 
 /* downloads page */
 /* we want scrolls! */
@@ -581,6 +825,13 @@ body#stats {
     font-size: 70%;
   }
 
+  #sidebarWrapper,
+  #sidebar,
+  #sidebarHandle {
+    display:none,
+
+  }
+
   #preso, .slide {
     border: 1px solid #999;
   }
@@ -615,6 +866,12 @@ body#stats {
     font-family: Monaco, monospace;
   }
 
-  /* page break and remove the preview styling */
-  .supplemental .content div.break { page-break-after: always; padding-bottom: 0; border-bottom: none; }
+  /* page break styling */
+  div.break {
+    page-break-after: always;
+    font-size: small;
+    font-style: italic;
+    padding-top: 0.25em;
+    padding-bottom: 0.25em;
+  }
 }

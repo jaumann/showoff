@@ -4,7 +4,7 @@ class ShowOffUtils
   # the result in a dictionrary
   #
   # Example:
-  # 
+  #
   #    "tpl=hpi,title=Over the rainbow"
   #
   #    will be stored as
@@ -13,7 +13,7 @@ class ShowOffUtils
   def self.parse_options(option_string="")
     result = {}
 
-    if option_string 
+    if option_string
       option_string.split(",").each do |element|
         pair = element.split("=")
         result[pair[0]] = pair.size > 1 ? pair[1] : nil
@@ -99,7 +99,7 @@ class ShowOffUtils
   # generate a static version of the site into the gh-pages branch
   def self.github
     ShowOff.do_static(nil)
-    `git add static`
+    `git add -f static`
     sha = `git write-tree`.chomp
     tree_sha = `git rev-parse #{sha}:static`.chomp
     `git read-tree HEAD`  # reset staging to last-commit
@@ -323,6 +323,11 @@ class ShowOffUtils
     get_config_option(dir, "markdown", "redcarpet")
   end
 
+  def self.showoff_renderer_options(dir = '.', default_options = MarkdownConfig::defaults(dir))
+    opts = get_config_option(dir, showoff_markdown(dir), default_options)
+    Hash[opts.map {|k, v| [k.to_sym, v]}] if opts    # keys must be symbols
+  end
+
   def self.get_config_option(dir, option, default = nil)
     index = File.join(dir, ShowOffUtils.presentation_config_file)
     if File.exists?(index)
@@ -417,26 +422,57 @@ module MarkdownConfig
       require 'maruku/ext/math'
 
       # Load maruku options
-      opts = ShowOffUtils.get_config_option(dir_name, 'maruku',
-                                            { 'use_tex' => false,
-                                              'png_dir' => 'images',
-                                              'html_png_url' => '/file/images/'})
+      opts = ShowOffUtils.showoff_renderer_options(dir_name,
+                                                   { :use_tex => false,
+                                                     :png_dir => 'images',
+                                                     :html_png_url => '/file/images/'})
 
-      if opts['use_tex']
+      if opts[:use_tex]
         MaRuKu::Globals[:html_math_output_mathml] = false
         MaRuKu::Globals[:html_math_engine] = 'none'
         MaRuKu::Globals[:html_math_output_png] = true
         MaRuKu::Globals[:html_png_engine] =  'blahtex'
-        MaRuKu::Globals[:html_png_dir] = opts['png_dir']
-        MaRuKu::Globals[:html_png_url] = opts['html_png_url']
+        MaRuKu::Globals[:html_png_dir] = opts[:png_dir]
+        MaRuKu::Globals[:html_png_url] = opts[:html_png_url]
       end
 
     when 'bluecloth'
       Tilt.prefer Tilt::BlueClothTemplate, "markdown"
 
+    when 'kramdown'
+      Tilt.prefer Tilt::KramdownTemplate, "markdown"
+
     else
       Tilt.prefer Tilt::RedcarpetTemplate, "markdown"
 
+    end
+  end
+
+  def self.defaults(dir_name)
+    case ShowOffUtils.showoff_markdown(dir_name)
+    when 'rdiscount'
+      {
+        :autolink          => true,
+      }
+    when 'maruku'
+      {}
+    when 'bluecloth'
+      {
+        :auto_links        => true,
+        :definition_lists  => true,
+        :superscript       => true,
+        :tables            => true,
+      }
+    when 'kramdown'
+      {}
+    else
+      {
+        :autolink          => true,
+        :no_intra_emphasis => true,
+        :superscript       => true,
+        :tables            => true,
+        :underline         => true,
+      }
     end
   end
 end
